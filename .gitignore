@@ -1,0 +1,24 @@
+*~
+plan/
+/target
+/target-*/
+/dist
+/corpus
+/log
+.DS_Store
+.claude/
+/craft-fonts
+# nix build / nix develop
+/result
+/result-*
+# model weights are never committed (SAM 3: docs/ai-masks.md)
+*.safetensors
+*.safetensors.part
+
+# Python tools import their public operator family.
+__pycache__/
+
+# Checked out inside the workspace by the shared nightly workflows (craft-common-actions).
+/.nightly-tools
+/.nightly-input
+/craft-i18n

@@ -1,0 +1,734 @@
+//! Text prompts (SAM 3's concept detector): the prompt's CLIP features fused into the image
+//! features by a DETR encoder, 200 object queries refined by a DETR decoder (with box
+//! relative-position bias and a presence token), per-query masks from a pixel decoder.
+//!
+//! Modified work (Apache License 2.0, §4(b)): ported by the LightCraft contributors in 2026 from
+//! the Python/PyTorch SAM 3 code of Hugging Face Transformers (`models/sam3/modeling_sam3.py`), Copyright The HuggingFace
+//! Team and Meta Platforms, Inc.; translated to Rust on candle and restructured. See NOTICE.
+
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock, PoisonError};
+
+use candle_core::{D, Device, IndexOp, Module, Tensor};
+use candle_nn::{Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder};
+
+use crate::clip::TextEncoder;
+use crate::neck::{FPN, Neck};
+use crate::nn::{
+    Attention, DecoderMlp, GroupNormRelu, Mlp, TORCH_LN_EPS, cxcywh_to_xyxy, inverse_sigmoid, linear, ln, padding_bias, sine_grid, to_vec,
+};
+use crate::{BackboneAccel, Error, Prediction, Result, cpu};
+
+const HIDDEN: usize = FPN;
+const HEADS: usize = 8;
+const QUERIES: usize = 200;
+const LAYERS: usize = 6;
+/// Prompts whose text features are kept: they don't depend on the image, and the same few come back (Subject's
+/// "person" on every photo). 32 KB each.
+const TEXT_CACHE: usize = 16;
+
+/// Detector image features, computed once per image.
+pub struct Features {
+    /// Levels 0..=2 (288, 144, 72 per side).
+    levels: Vec<Tensor>,
+    /// Level 2 flattened `[1, 5184, 256]` and its sine position encoding.
+    flat: Tensor,
+    pos: Tensor,
+    side: usize,
+}
+
+/// Everything the detector predicts for one prompt.
+pub struct Output {
+    /// Per-query mask logits `[200, 288, 288]` flattened.
+    pub masks: Tensor,
+    /// Per-query logits (before the presence score).
+    pub logits: Vec<f32>,
+    /// Whether the concept is in the image at all (logit).
+    pub presence: f32,
+    /// Boxes (x0, y0, x1, y1), normalized.
+    pub boxes: Vec<[f32; 4]>,
+    /// The text features `[1, 32, 256]` (tests).
+    pub text: Tensor,
+    /// Semantic logits `[288, 288]` flattened: everything the prompt names, one mask without
+    /// boundaries between instances.
+    pub semantic: Vec<f32>,
+    /// The DETR encoder's memory `[1, 5184, 256]` (tests).
+    pub memory: Tensor,
+}
+
+/// Where the DETR encoder and the mask decoder may run outside candle: the model's accelerator (if it still has one),
+/// and why the encoder (`failed`) or the mask decoder (`masks_failed`) stopped running there (set on its first failure;
+/// from then on candle runs it).
+pub struct EncoderAccel<'a> {
+    pub accel: &'a Mutex<Option<Box<dyn BackboneAccel>>>,
+    pub failed: &'a OnceLock<String>,
+    pub masks_failed: &'a OnceLock<String>,
+}
+
+struct EncoderLayer {
+    ln1: LayerNorm,
+    self_attn: Attention,
+    ln2: LayerNorm,
+    cross_attn: Attention,
+    ln3: LayerNorm,
+    mlp: Mlp,
+}
+
+struct DecoderLayer {
+    self_attn: Attention,
+    self_ln: LayerNorm,
+    text_attn: Attention,
+    text_ln: LayerNorm,
+    vision_attn: Attention,
+    vision_ln: LayerNorm,
+    mlp: Mlp,
+    mlp_ln: LayerNorm,
+}
+
+pub struct Detector {
+    device: Device,
+    neck: Neck,
+    text: TextEncoder,
+    text_proj: Linear,
+    /// The latest prompts' token ids and valid marks with their features `[1, 32, 256]`, most recent last.
+    texts: Mutex<VecDeque<(Vec<u32>, Vec<bool>, Tensor)>>,
+    encoder: Vec<EncoderLayer>,
+    decoder: Vec<DecoderLayer>,
+    out_ln: LayerNorm,
+    box_head: DecoderMlp,
+    query_embed: Tensor,
+    reference_points: Tensor,
+    presence_token: Tensor,
+    presence_head: DecoderMlp,
+    presence_ln: LayerNorm,
+    ref_point_head: DecoderMlp,
+    rpb_x: DecoderMlp,
+    rpb_y: DecoderMlp,
+    // dot-product scoring
+    score_text_mlp: DecoderMlp,
+    score_text_ln: LayerNorm,
+    score_text_proj: Linear,
+    score_query_proj: Linear,
+    // mask decoder
+    prompt_attn: Attention,
+    prompt_ln: LayerNorm,
+    pixel_convs: Vec<Conv2d>,
+    pixel_norms: Vec<GroupNormRelu>,
+    instance_proj: Conv2d,
+    semantic_proj: Conv2d,
+    mask_embedder: Vec<Linear>,
+}
+
+impl Detector {
+    /// `vb` at `detector_model`.
+    pub fn new(vb: VarBuilder) -> Result<Self> {
+        let e = vb.pp("detr_encoder");
+        let mut encoder = Vec::with_capacity(LAYERS);
+        for i in 0..LAYERS {
+            let l = e.pp(format!("layers.{i}"));
+            encoder.push(EncoderLayer {
+                ln1: ln(HIDDEN, TORCH_LN_EPS, l.pp("layer_norm1"))?,
+                self_attn: Attention::new(HIDDEN, HIDDEN, HEADS, l.pp("self_attn"))?,
+                ln2: ln(HIDDEN, TORCH_LN_EPS, l.pp("layer_norm2"))?,
+                cross_attn: Attention::new(HIDDEN, HIDDEN, HEADS, l.pp("cross_attn"))?,
+                ln3: ln(HIDDEN, TORCH_LN_EPS, l.pp("layer_norm3"))?,
+                mlp: Mlp::new(HIDDEN, 2048, false, l.pp("mlp"))?,
+            });
+        }
+        let d = vb.pp("detr_decoder");
+        let mut decoder = Vec::with_capacity(LAYERS);
+        for i in 0..LAYERS {
+            let l = d.pp(format!("layers.{i}"));
+            decoder.push(DecoderLayer {
+                self_attn: Attention::new(HIDDEN, HIDDEN, HEADS, l.pp("self_attn"))?,
+                self_ln: ln(HIDDEN, TORCH_LN_EPS, l.pp("self_attn_layer_norm"))?,
+                text_attn: Attention::new(HIDDEN, HIDDEN, HEADS, l.pp("text_cross_attn"))?,
+                text_ln: ln(HIDDEN, TORCH_LN_EPS, l.pp("text_cross_attn_layer_norm"))?,
+                vision_attn: Attention::new(HIDDEN, HIDDEN, HEADS, l.pp("vision_cross_attn"))?,
+                vision_ln: ln(HIDDEN, TORCH_LN_EPS, l.pp("vision_cross_attn_layer_norm"))?,
+                mlp: Mlp::new(HIDDEN, 2048, false, l.pp("mlp"))?,
+                mlp_ln: ln(HIDDEN, TORCH_LN_EPS, l.pp("mlp_layer_norm"))?,
+            });
+        }
+        let s = vb.pp("dot_product_scoring");
+        let m = vb.pp("mask_decoder");
+        let p = m.pp("pixel_decoder");
+        let conv3 = Conv2dConfig { padding: 1, ..Default::default() };
+        Ok(Self {
+            device: vb.device().clone(),
+            neck: Neck::new(vb.pp("vision_encoder.neck"))?,
+            text: TextEncoder::new(vb.pp("text_encoder.text_model"))?,
+            text_proj: linear(1024, HIDDEN, vb.pp("text_projection"))?,
+            texts: Mutex::new(VecDeque::with_capacity(TEXT_CACHE)),
+            encoder,
+            decoder,
+            out_ln: ln(HIDDEN, TORCH_LN_EPS, d.pp("output_layer_norm"))?,
+            box_head: DecoderMlp::new(HIDDEN, HIDDEN, 4, 3, d.pp("box_head"))?,
+            query_embed: d.get((QUERIES, HIDDEN), "query_embed.weight")?.unsqueeze(0)?,
+            reference_points: d.get((QUERIES, 4), "reference_points.weight")?.unsqueeze(0)?,
+            presence_token: d.get((1, HIDDEN), "presence_token.weight")?.unsqueeze(0)?,
+            presence_head: DecoderMlp::new(HIDDEN, HIDDEN, 1, 3, d.pp("presence_head"))?,
+            presence_ln: ln(HIDDEN, TORCH_LN_EPS, d.pp("presence_layer_norm"))?,
+            ref_point_head: DecoderMlp::new(2 * HIDDEN, HIDDEN, HIDDEN, 2, d.pp("ref_point_head"))?,
+            rpb_x: DecoderMlp::new(2, HIDDEN, HEADS, 2, d.pp("box_rpb_embed_x"))?,
+            rpb_y: DecoderMlp::new(2, HIDDEN, HEADS, 2, d.pp("box_rpb_embed_y"))?,
+            score_text_mlp: DecoderMlp::new(HIDDEN, 2048, HIDDEN, 2, s.pp("text_mlp"))?,
+            score_text_ln: ln(HIDDEN, TORCH_LN_EPS, s.pp("text_mlp_out_norm"))?,
+            score_text_proj: linear(HIDDEN, HIDDEN, s.pp("text_proj"))?,
+            score_query_proj: linear(HIDDEN, HIDDEN, s.pp("query_proj"))?,
+            prompt_attn: Attention::new(HIDDEN, HIDDEN, HEADS, m.pp("prompt_cross_attn"))?,
+            prompt_ln: ln(HIDDEN, TORCH_LN_EPS, m.pp("prompt_cross_attn_norm"))?,
+            pixel_convs: (0..3).map(|i| Ok(candle_nn::conv2d(HIDDEN, HIDDEN, 3, conv3, p.pp(format!("conv_layers.{i}")))?)).collect::<Result<_>>()?,
+            pixel_norms: (0..3).map(|i| GroupNormRelu::new(8, HIDDEN, 1e-5, p.pp(format!("norms.{i}")))).collect::<Result<_>>()?,
+            instance_proj: candle_nn::conv2d(HIDDEN, HIDDEN, 1, Conv2dConfig::default(), m.pp("instance_projection"))?,
+            semantic_proj: candle_nn::conv2d(HIDDEN, 1, 1, Conv2dConfig::default(), m.pp("semantic_projection"))?,
+            mask_embedder: (0..3).map(|i| linear(HIDDEN, HIDDEN, m.pp(format!("mask_embedder.layers.{i}")))).collect::<Result<_>>()?,
+        })
+    }
+
+    /// The detector's feature pyramid for the backbone output `[1, 1024, 72, 72]`, or from its neck's three
+    /// levels when they were computed elsewhere (an accelerator).
+    pub fn features(&self, backbone: &Tensor, levels: Option<Vec<Tensor>>) -> Result<Features> {
+        let levels = match levels {
+            Some(levels) => levels,
+            None => self.neck.forward(backbone, 3)?,
+        };
+        let last = levels.last().ok_or_else(|| Error::Model("detector neck".into()))?;
+        let (_, _, side, _) = last.dims4()?;
+        let flat = last.flatten_from(2)?.transpose(1, 2)?.contiguous()?;
+        let pos = sine_grid(side, side, HIDDEN / 2, &self.device)?.flatten_from(2)?.transpose(1, 2)?.contiguous()?;
+        Ok(Features { levels, flat, pos, side })
+    }
+
+    /// The prompt's features `[1, 32, 256]`: the CLIP text encoder and its projection, or the same tensor again
+    /// when the prompt was among the last [`TEXT_CACHE`].
+    fn text_features(&self, ids: &[u32], valid: &[bool]) -> Result<Tensor> {
+        let mut texts = self.texts.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(seen) = texts.iter().position(|(i, v, _)| i == ids && v == valid).and_then(|at| texts.remove(at)) {
+            let text = seen.2.clone();
+            texts.push_back(seen);
+            return Ok(text);
+        }
+        let text = self.text_proj.forward(&self.text.forward(ids, valid)?)?;
+        if texts.len() >= TEXT_CACHE {
+            texts.pop_front();
+        }
+        texts.push_back((ids.to_vec(), valid.to_vec(), text.clone()));
+        Ok(text)
+    }
+
+    /// Box relative-position bias `[1, heads, 1 + 200, side²]` for reference boxes (cx, cy, w, h).
+    fn rpb(&self, boxes: &Tensor, side: usize) -> Result<Tensor> {
+        let xyxy = cxcywh_to_xyxy(boxes)?.squeeze(0)?; // [200, 4]
+        let coords = Tensor::arange(0u32, side as u32, &self.device)?.to_dtype(candle_core::DType::F32)?.affine(1.0 / side as f64, 0.0)?;
+        let coords = coords.reshape((1, side, 1))?;
+        let log_scale = |d: Tensor| -> Result<Tensor> {
+            let d = (d * 8.0)?;
+            Ok(d.sign()?.mul(&((d.abs()? + 1.0)?.log()? / (8f64.ln()))?)?)
+        };
+        let pick = |a: usize, b: usize| -> Result<Tensor> { Ok(Tensor::cat(&[xyxy.narrow(1, a, 1)?, xyxy.narrow(1, b, 1)?], 1)?.unsqueeze(1)?) };
+        let dy = log_scale(coords.broadcast_sub(&pick(1, 3)?)?)?; // [200, side, 2]
+        let dx = log_scale(coords.broadcast_sub(&pick(0, 2)?)?)?;
+        let ey = self.rpb_y.forward(&dy)?; // [200, side, heads]
+        let ex = self.rpb_x.forward(&dx)?;
+        if self.device.is_cpu() {
+            return cpu::box_bias(&ey, &ex);
+        }
+        let m = ey.unsqueeze(2)?.broadcast_add(&ex.unsqueeze(1)?)?; // [200, side, side, heads]
+        let m = m.reshape((QUERIES, side * side, HEADS))?.permute((2, 0, 1))?; // [heads, 200, side²]
+        let m = m.pad_with_zeros(1, 1, 0)?; // the presence token attends everywhere
+        Ok(m.unsqueeze(0)?.contiguous()?)
+    }
+
+    /// Sine embedding of boxes (cx, cy, w, h) `[1, 200, 512]` (y, x, w, h features).
+    fn box_sine(&self, boxes: &Tensor) -> Result<Tensor> {
+        let feats = HIDDEN / 2;
+        let dim_t: Vec<f32> = (0..feats).map(|i| 10000f64.powf(2.0 * (i / 2) as f64 / feats as f64) as f32).collect();
+        let dim_t = Tensor::from_vec(dim_t, (1, 1, feats), &self.device)?;
+        let even: Vec<f32> = (0..feats).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
+        let even = Tensor::from_vec(even, (1, 1, feats), &self.device)?;
+        let one = |i: usize| -> Result<Tensor> {
+            let p = (boxes.narrow(D::Minus1, i, 1)? * (2.0 * std::f64::consts::PI))?.broadcast_div(&dim_t)?;
+            Ok((p.sin()?.broadcast_mul(&even)? + p.cos()?.broadcast_mul(&(1.0 - &even)?)?)?)
+        };
+        Ok(Tensor::cat(&[one(1)?, one(0)?, one(2)?, one(3)?], D::Minus1)?)
+    }
+
+    /// The DETR encoder: image tokens attend to themselves and to the prompt. Returns the memory `[1, 5184, 256]`.
+    fn encode(&self, f: &Features, text: &Tensor, text_bias: &Tensor) -> Result<Tensor> {
+        let mut x = f.flat.clone();
+        for l in &self.encoder {
+            let h = l.ln1.forward(&x)?;
+            let hp = (&h + &f.pos)?;
+            x = (&x + l.self_attn.forward(&hp, &hp, &h, None)?)?;
+            let h = l.ln2.forward(&x)?;
+            x = (&x + l.cross_attn.forward(&h, text, text, Some(text_bias))?)?;
+            let h = l.ln3.forward(&x)?;
+            x = l.mlp.forward_add(&h, &x)?;
+        }
+        Ok(x)
+    }
+
+    /// [`Detector::encode`] on the accelerator; `None` when there is none, or it doesn't run the encoder or fails (the
+    /// first failure is logged and noted in `accel.failed`, and the accelerator isn't asked again). `Err` when the app is
+    /// closing.
+    fn encode_accelerated(&self, f: &Features, text: &Tensor, valid: &[bool], accel: &EncoderAccel) -> Result<Option<Tensor>> {
+        if accel.failed.get().is_some() {
+            return Ok(None);
+        }
+        let guard = accel.accel.lock().unwrap_or_else(PoisonError::into_inner);
+        // an accelerator for the backbone only: candle runs this, and that is no failure
+        let Some(a) = guard.as_ref().filter(|a| a.runs_detr_encoder()) else { return Ok(None) };
+        let image = to_vec(&f.flat)?;
+        let want = image.len();
+        // what the decoder can't use is a failure too: a wrong size, or NaN / ∞ from a broken kernel
+        let checked = a.detr_encoder(&image, &to_vec(&f.pos)?, &to_vec(text)?, valid).and_then(|out| {
+            if out.len() != want {
+                Err(format!("it returned {} values instead of {want}", out.len()))
+            } else if out.iter().any(|v| !v.is_finite()) {
+                Err("it returned values that are not numbers".into())
+            } else {
+                Ok(out)
+            }
+        });
+        match checked {
+            Ok(out) => Ok(Some(Tensor::from_vec(out, f.flat.dims(), &self.device)?)),
+            Err(e) if a.closing() => Err(Error::Model(e)),
+            Err(e) => {
+                log::warn!("SAM 3 DETR encoder not run on {} ({e}); using the {} for it from now on", a.device(), crate::device_name(&self.device));
+                let _ = accel.failed.set(format!("{}: {e}", a.device()));
+                Ok(None)
+            }
+        }
+    }
+
+    /// The mask decoder in candle: the per-query mask logits `[200, 288, 288]` for the encoder memory and the mask
+    /// embeddings `e` `[1, 200, 256]`.
+    fn masks(&self, f: &Features, memory: &Tensor, text: &Tensor, text_bias: &Tensor, e: &Tensor) -> Result<(Tensor, Vec<f32>)> {
+        // the encoder memory attends to the prompt, then a pixel decoder up to 288²
+        let mem = (memory + self.prompt_attn.forward(&self.prompt_ln.forward(memory)?, text, text, Some(text_bias))?)?;
+        let [l0, l1, _] = &f.levels[..] else { return Err(Error::Model("detector levels".into())) };
+        let mut prev = mem.transpose(1, 2)?.reshape((1, HIDDEN, f.side, f.side))?;
+        for (i, skip) in [l1, l0].into_iter().enumerate() {
+            let (_, _, sh, sw) = skip.dims4()?;
+            prev = (prev.upsample_nearest2d(sh, sw)? + skip)?;
+            let (Some(conv), Some(norm)) = (self.pixel_convs.get(i), self.pixel_norms.get(i)) else {
+                return Err(Error::Model("pixel decoder".into()));
+            };
+            prev = norm.forward(&conv.forward(&prev)?)?;
+        }
+        let inst = self.instance_proj.forward(&prev)?; // [1, 256, 288, 288]
+        let semantic = to_vec(&self.semantic_proj.forward(&prev)?)?;
+        let (_, c, mh, mw) = inst.dims4()?;
+        Ok((e.matmul(&inst.reshape((1, c, mh * mw))?)?.reshape((QUERIES, mh, mw))?, semantic))
+    }
+
+    /// [`Detector::masks`] on the accelerator (the semantic mask as one more row of the same product); `None` when there
+    /// is none, or it doesn't run the mask decoder or fails
+    /// (the first failure is logged and noted in `accel.masks_failed`, and the accelerator isn't asked again). `Err` when
+    /// the app is closing.
+    fn masks_accelerated(
+        &self,
+        f: &Features,
+        memory: &Tensor,
+        (text, valid): (&Tensor, &[bool]),
+        e: &Tensor,
+        accel: &EncoderAccel,
+    ) -> Result<Option<(Tensor, Vec<f32>)>> {
+        if accel.masks_failed.get().is_some() {
+            return Ok(None);
+        }
+        let guard = accel.accel.lock().unwrap_or_else(PoisonError::into_inner);
+        // an accelerator for the backbone only: candle runs this, and that is no failure
+        let Some(a) = guard.as_ref().filter(|a| a.runs_mask_decoder()) else { return Ok(None) };
+        let [l0, l1, _] = &f.levels[..] else { return Err(Error::Model("detector levels".into())) };
+        let (_, _, mh, mw) = l0.dims4()?;
+        // the instance projection folded into the embeddings: e · (W x + b) = (e W) x + e b, one product per pixel
+        let e = e.squeeze(0)?; // [200, 256]
+        let rows = e.matmul(&self.instance_proj.weight().reshape((HIDDEN, HIDDEN))?)?;
+        let mut bias = match self.instance_proj.bias() {
+            Some(b) => to_vec(&e.matmul(&b.unsqueeze(1)?)?)?,
+            None => vec![0.0; QUERIES],
+        };
+        // the semantic projection (1 × 1, 256 → 1) is one more row: the last mask is the semantic one
+        let rows = Tensor::cat(&[rows, self.semantic_proj.weight().reshape((1, HIDDEN))?], 0)?;
+        bias.push(match self.semantic_proj.bias() {
+            Some(b) => to_vec(b)?.first().copied().unwrap_or(0.0),
+            None => 0.0,
+        });
+        let want = (QUERIES + 1) * mh * mw;
+        // what the masks can't use is a failure too: a wrong size, or NaN / ∞ from a broken kernel
+        let checked = a.mask_decoder(&to_vec(memory)?, &to_vec(text)?, valid, [&to_vec(l1)?, &to_vec(l0)?], &to_vec(&rows)?, &bias).and_then(|out| {
+            if out.len() != want {
+                Err(format!("it returned {} values instead of {want}", out.len()))
+            } else if !out.iter().fold(true, |ok, v| ok & v.is_finite()) {
+                // without short-cutting, so that it vectorizes (17 M values)
+                Err("it returned values that are not numbers".into())
+            } else {
+                Ok(out)
+            }
+        });
+        match checked {
+            Ok(mut out) => {
+                let semantic = out.split_off(QUERIES * mh * mw);
+                Ok(Some((Tensor::from_vec(out, (QUERIES, mh, mw), &self.device)?, semantic)))
+            }
+            Err(e) if a.closing() => Err(Error::Model(e)),
+            Err(e) => {
+                log::warn!("SAM 3 mask decoder not run on {} ({e}); using the {} for it from now on", a.device(), crate::device_name(&self.device));
+                let _ = accel.masks_failed.set(format!("{}: {e}", a.device()));
+                Ok(None)
+            }
+        }
+    }
+
+    /// Run the detector for one tokenized prompt, the DETR encoder and the mask decoder on `accel` when it runs them.
+    pub fn predict(&self, f: &Features, ids: &[u32], valid: &[bool], accel: &EncoderAccel) -> Result<Output> {
+        let text = self.text_features(ids, valid)?;
+        let text_bias = padding_bias(valid, &self.device)?;
+
+        let memory = match self.encode_accelerated(f, &text, valid, accel)? {
+            Some(memory) => memory,
+            None => self.encode(f, &text, &text_bias)?,
+        };
+
+        // DETR decoder: presence token + 200 queries with iterative box refinement
+        let mut boxes = candle_nn::ops::sigmoid(&self.reference_points)?;
+        let mut h = Tensor::cat(&[self.presence_token.clone(), self.query_embed.clone()], 1)?;
+        let key_pos = (&memory + &f.pos)?;
+        let mut queries = None;
+        let mut presence = None;
+        for l in &self.decoder {
+            let qpos = self.ref_point_head.forward(&self.box_sine(&boxes)?)?.pad_with_zeros(1, 1, 0)?;
+            let bias = self.rpb(&boxes, f.side)?;
+            let q = (&h + &qpos)?;
+            h = l.self_ln.forward(&(&h + l.self_attn.forward(&q, &q, &h, None)?)?)?;
+            let q = (&h + &qpos)?;
+            h = l.text_ln.forward(&(&h + l.text_attn.forward(&q, &text, &text, Some(&text_bias))?)?)?;
+            let q = (&h + &qpos)?;
+            h = l.vision_ln.forward(&(&h + l.vision_attn.forward(&q, &key_pos, &memory, Some(&bias))?)?)?;
+            h = l.mlp_ln.forward(&l.mlp.forward_add(&h, &h)?)?;
+            let qh = self.out_ln.forward(&h.narrow(1, 1, QUERIES)?)?;
+            boxes = candle_nn::ops::sigmoid(&(self.box_head.forward(&qh)? + inverse_sigmoid(&boxes)?)?)?;
+            let p = self.presence_head.forward(&self.presence_ln.forward(&h.narrow(1, 0, 1)?)?)?;
+            presence = Some(p.clamp(-10f32, 10f32)?);
+            queries = Some(qh);
+        }
+        let (Some(queries), Some(presence)) = (queries, presence) else { return Err(Error::Model("decoder has no layers".into())) };
+
+        // dot-product scoring against the mean of the (refined) prompt tokens
+        let t = self.score_text_ln.forward(&(self.score_text_mlp.forward(&text)? + &text)?)?;
+        let w: Vec<f32> = valid.iter().map(|v| if *v { 1.0 } else { 0.0 }).collect();
+        let count = w.iter().sum::<f32>().max(1.0);
+        let w = Tensor::from_vec(w, (1, valid.len(), 1), &self.device)?;
+        let pooled = (t.broadcast_mul(&w)?.sum(1)? / f64::from(count))?; // [1, 256]
+        let pt = self.score_text_proj.forward(&pooled)?; // [1, 256]
+        let pq = self.score_query_proj.forward(&queries)?; // [1, 200, 256]
+        let logits = (pq.matmul(&pt.unsqueeze(2)?)? / (HIDDEN as f64).sqrt())?.clamp(-12f32, 12f32)?;
+
+        // masks: each query's mask embedding against the mask decoder's per-pixel output
+        let mut e = queries.clone();
+        for (i, l) in self.mask_embedder.iter().enumerate() {
+            e = l.forward(&e)?;
+            if i + 1 < self.mask_embedder.len() {
+                e = e.relu()?;
+            }
+        }
+        let (masks, semantic) = match self.masks_accelerated(f, &memory, (&text, valid), &e, accel)? {
+            Some(masks) => masks,
+            None => self.masks(f, &memory, &text, &text_bias, &e)?,
+        };
+        let boxes = cxcywh_to_xyxy(&boxes)?;
+        let bv = to_vec(&boxes)?;
+        Ok(Output {
+            masks,
+            logits: to_vec(&logits)?,
+            presence: to_vec(&presence)?.first().copied().unwrap_or(-10.0),
+            boxes: bv.as_chunks::<4>().0.to_vec(),
+            text,
+            semantic,
+            memory,
+        })
+    }
+}
+
+/// How far below 0 the strongest instance may be where it still takes its share of the semantic mask.
+const NEAR: f32 = 4.0;
+
+/// Gives each of `instances` its share of `semantic` (everything the prompt names, one mask): where an
+/// instance is the strongest and near (above −[`NEAR`]), the semantic logits replace its own (it keeps
+/// its own where it is surer of itself). An instance's own logits stay close to 0 even well inside it
+/// (a person comes out about 90 % selected) and both fade where two instances touch, which leaves a gap
+/// between them; the semantic mask is surer inside and runs on across that boundary. Cells far from
+/// every instance keep their logits, so things no instance found don't join one.
+pub fn share(instances: &mut [Vec<f32>], semantic: &[f32]) {
+    let n = semantic.len();
+    if instances.is_empty() || instances.iter().any(|l| l.len() != n) {
+        return;
+    }
+    for (i, s) in semantic.iter().enumerate() {
+        let Some((k, best)) = instances.iter().enumerate().map(|(k, l)| (k, l[i])).max_by(|a, b| a.1.total_cmp(&b.1)) else { return };
+        if best > -NEAR {
+            let l = &mut instances[k][i];
+            *l = if *l > 0.0 { l.max(*s) } else { *s };
+        }
+    }
+}
+
+/// The instances of `out` scoring above `threshold` (sigmoid(logit) × sigmoid(presence)),
+/// merged into one mask: each its share of the semantic mask ([`share`]), then the per-pixel
+/// maximum of their probabilities, as logits.
+pub fn merge(out: &Output, threshold: f32) -> Option<Prediction> {
+    let s = |x: f32| 1.0 / (1.0 + (-x).exp());
+    let presence = s(out.presence);
+    let keep: Vec<(usize, f32)> = out.logits.iter().enumerate().map(|(i, l)| (i, s(*l) * presence)).filter(|(_, p)| *p > threshold).collect();
+    let best = keep.iter().map(|k| k.1).fold(0f32, f32::max);
+    let mut masks: Vec<Vec<f32>> = keep.iter().map(|(i, _)| out.masks.i(*i).ok().and_then(|t| to_vec(&t).ok())).collect::<Option<_>>()?;
+    share(&mut masks, &out.semantic);
+    let merged = masks.into_iter().reduce(|acc, m| acc.iter().zip(&m).map(|(a, b)| a.max(*b)).collect());
+    merged.map(|logits| Prediction { logits, score: best })
+}
+
+/// Share of the largest candidate's area another needs to count among the photo's main subjects
+/// (people in front, not the crowd behind them).
+pub const PROMINENT: f32 = 0.25;
+
+/// Which candidates are the photo's subject, given each one's area (cells it selects) and, when the
+/// camera recorded where it focused, whether it covers that point. The focus decides: the
+/// candidates it falls on, with the others about as large either way (a group at the same
+/// distance); a focus on none of them means the subject is something else (empty: the caller
+/// selects what is at the point).
+/// Without a focus: the largest, and the others about as large.
+pub fn pick_prominent(areas: &[usize], on_focus: Option<&[bool]>) -> Vec<usize> {
+    let largest = |ks: &mut dyn Iterator<Item = usize>| ks.filter_map(|k| areas.get(k).copied()).max().unwrap_or(0);
+    let near = |a: usize, of: usize| of > 0 && a as f32 >= PROMINENT * of as f32;
+    match on_focus {
+        Some(hit) => {
+            let focused: Vec<usize> = (0..areas.len()).filter(|k| hit.get(*k).copied().unwrap_or(false) && areas[*k] > 0).collect();
+            if focused.is_empty() {
+                return Vec::new();
+            }
+            // about as large as what is in focus, either way: much larger is nearer the camera
+            // than the focus, so out of focus too
+            let of = largest(&mut focused.iter().copied());
+            let alike = |a: usize| near(a, of) && (a as f32) * PROMINENT <= of as f32;
+            (0..areas.len()).filter(|k| focused.contains(k) || alike(areas[*k])).collect()
+        }
+        None => {
+            let of = largest(&mut (0..areas.len()));
+            (0..areas.len()).filter(|k| near(areas[*k], of)).collect()
+        }
+    }
+}
+
+/// The instances of several detector outputs (one per concept: "person", "animal") above
+/// `threshold` that [`pick_prominent`] keeps, each with its share of its concept's semantic mask,
+/// merged into one mask. `focus`: where the camera focused (normalized). `None` when nothing is kept.
+pub fn subject(outs: &[Output], threshold: f32, focus: Option<(f32, f32)>) -> Option<Prediction> {
+    let s = |x: f32| 1.0 / (1.0 + (-x).exp());
+    // (mask, score, concept)
+    let mut cands: Vec<(Vec<f32>, f32, usize)> = Vec::new();
+    for (c, out) in outs.iter().enumerate() {
+        let presence = s(out.presence);
+        for (i, l) in out.logits.iter().enumerate() {
+            let p = s(*l) * presence;
+            if p > threshold
+                && let Some(m) = out.masks.i(i).ok().and_then(|t| to_vec(&t).ok())
+            {
+                cands.push((m, p, c));
+            }
+        }
+    }
+    let n = cands.first()?.0.len();
+    let side = (n as f64).sqrt() as usize;
+    if side == 0 || side * side != n || cands.iter().any(|c| c.0.len() != n) {
+        return None;
+    }
+    let areas: Vec<usize> = cands.iter().map(|c| c.0.iter().filter(|l| **l > 0.0).count()).collect();
+    let cell = focus.filter(|(x, y)| x.is_finite() && y.is_finite()).map(|(x, y)| {
+        let at = |v: f32| ((v.clamp(0.0, 1.0) * side as f32) as usize).min(side - 1);
+        at(y) * side + at(x)
+    });
+    let hits: Option<Vec<bool>> = cell.map(|i| cands.iter().map(|c| c.0.get(i).is_some_and(|l| *l > 0.0)).collect());
+    let keep = pick_prominent(&areas, hits.as_deref());
+    if keep.is_empty() {
+        return None;
+    }
+    let best = keep.iter().filter_map(|k| cands.get(*k)).map(|c| c.1).fold(0f32, f32::max);
+    let mut merged: Option<Vec<f32>> = None;
+    for (c, out) in outs.iter().enumerate() {
+        let mut masks: Vec<Vec<f32>> = keep.iter().filter_map(|k| cands.get(*k)).filter(|x| x.2 == c).map(|x| x.0.clone()).collect();
+        if masks.is_empty() {
+            continue;
+        }
+        share(&mut masks, &out.semantic);
+        for m in masks {
+            merged = Some(match merged {
+                Some(acc) => acc.iter().zip(&m).map(|(a, b)| a.max(*b)).collect(),
+                None => m,
+            });
+        }
+    }
+    merged.map(|logits| Prediction { logits, score: best })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::Sam3;
+
+    /// The real checkpoint in `$LIGHTCRAFT_SAM3_DIR` (as the GPU tests), or `None` (the test skips) without it or when it
+    /// doesn't load.
+    fn model() -> Option<Sam3> {
+        let dir = std::env::var_os("LIGHTCRAFT_SAM3_DIR").filter(|v| !v.is_empty()).map(PathBuf::from)?;
+        if !crate::is_model_dir(&dir) {
+            return None;
+        }
+        match Sam3::load_on(&dir, Device::Cpu) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("the model in {} doesn't load: {e}", dir.display());
+                None
+            }
+        }
+    }
+
+    fn values(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1().unwrap()
+    }
+
+    #[test]
+    fn the_box_bias_matches_the_tensor_ops_on_random_boxes() {
+        let Some(mut m) = model() else {
+            lightcraft_testkit::skip!(Model, "SAM 3 not installed (set LIGHTCRAFT_SAM3_DIR)");
+            return;
+        };
+        let (det, _, _) = m.detector_parts().unwrap();
+        let side = 72;
+        for _ in 0..3 {
+            let centres = Tensor::rand(0f32, 1.0, (1, QUERIES, 2), &Device::Cpu).unwrap();
+            let sizes = Tensor::rand(0.01f32, 0.6, (1, QUERIES, 2), &Device::Cpu).unwrap();
+            let boxes = Tensor::cat(&[centres, sizes], 2).unwrap();
+            let got = det.rpb(&boxes, side).unwrap();
+            // what the other devices run, from the same row and column terms
+            let xyxy = cxcywh_to_xyxy(&boxes).unwrap().squeeze(0).unwrap();
+            let coords = Tensor::arange(0u32, side as u32, &Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap();
+            let coords = coords.affine(1.0 / side as f64, 0.0).unwrap().reshape((1, side, 1)).unwrap();
+            let term = |mlp: &DecoderMlp, a: usize, b: usize| {
+                let pick = Tensor::cat(&[xyxy.narrow(1, a, 1).unwrap(), xyxy.narrow(1, b, 1).unwrap()], 1).unwrap().unsqueeze(1).unwrap();
+                let d = (coords.broadcast_sub(&pick).unwrap() * 8.0).unwrap();
+                let d = d.sign().unwrap().mul(&((d.abs().unwrap() + 1.0).unwrap().log().unwrap() / 8f64.ln()).unwrap()).unwrap();
+                mlp.forward(&d).unwrap()
+            };
+            let (ey, ex) = (term(&det.rpb_y, 1, 3), term(&det.rpb_x, 0, 2));
+            let want = ey.unsqueeze(2).unwrap().broadcast_add(&ex.unsqueeze(1).unwrap()).unwrap();
+            let want = want.reshape((QUERIES, side * side, HEADS)).unwrap().permute((2, 0, 1)).unwrap().pad_with_zeros(1, 1, 0).unwrap();
+            assert_eq!(got.dims(), [1, HEADS, 1 + QUERIES, side * side]);
+            assert_eq!(values(&got), values(&want));
+        }
+    }
+
+    #[test]
+    fn prompt_features_are_kept_for_the_latest_prompts() {
+        let Some(mut m) = model() else {
+            lightcraft_testkit::skip!(Model, "SAM 3 not installed (set LIGHTCRAFT_SAM3_DIR)");
+            return;
+        };
+        let (det, tok, _) = m.detector_parts().unwrap();
+        let prompts: Vec<(Vec<u32>, Vec<bool>)> = (0..=TEXT_CACHE).map(|i| tok.encode(&format!("{i} people"))).collect();
+        let features = |i: usize| det.text_features(&prompts[i].0, &prompts[i].1).unwrap();
+        let first = features(0);
+        let fresh = det.text_proj.forward(&det.text.forward(&prompts[0].0, &prompts[0].1).unwrap()).unwrap();
+        assert_eq!(values(&first), values(&fresh));
+        // the same tensor again, also after other prompts
+        assert_eq!(features(0).id(), first.id());
+        let second = features(1);
+        for i in 2..TEXT_CACHE {
+            features(i);
+        }
+        assert_eq!(features(0).id(), first.id(), "prompt 0 is the latest one now");
+        // one more prompt drops the least recently used, prompt 1, which is computed again
+        features(TEXT_CACHE);
+        assert_eq!(det.texts.lock().unwrap().len(), TEXT_CACHE);
+        assert_eq!(features(0).id(), first.id());
+        let again = features(1);
+        assert_ne!(again.id(), second.id());
+        assert_eq!(values(&again), values(&second));
+    }
+
+    /// A group in front is kept, the crowd behind isn't; the camera's focus decides: on a person,
+    /// that person and the others as large; on nobody, nothing (the object there is the subject).
+    #[test]
+    fn prominent_subjects() {
+        // four people in front, two small ones far behind
+        let areas = [900, 1000, 800, 950, 60, 40];
+        assert_eq!(pick_prominent(&areas, None), vec![0, 1, 2, 3]);
+        // focused on the first: the group
+        let hit = [true, false, false, false, false, false];
+        assert_eq!(pick_prominent(&areas, Some(&hit)), vec![0, 1, 2, 3]);
+        // focused on someone small behind: that one and whoever is about as large, not the
+        // (much larger, so nearer and out of focus) group in front
+        let hit = [false, false, false, false, true, false];
+        assert_eq!(pick_prominent(&areas, Some(&hit)), vec![4, 5]);
+        // a product in front of people: the focus is on none of them
+        assert!(pick_prominent(&areas, Some(&[false; 6])).is_empty());
+        // nobody at all, or empty masks
+        assert!(pick_prominent(&[], None).is_empty());
+        assert!(pick_prominent(&[0, 0], None).is_empty());
+        assert!(pick_prominent(&[0, 5], Some(&[true, false])).is_empty());
+        // a mismatched focus list is read as "not on it"
+        assert_eq!(pick_prominent(&[10, 9], Some(&[true])), vec![0, 1]);
+    }
+
+    /// Two people side by side on a row of cells, each only weakly sure of themself and both fading where
+    /// they touch; the semantic mask is sure of both and runs across. Each takes the semantic logits where
+    /// it is the strongest instance, a third region nobody is near keeps its own.
+    #[test]
+    fn instances_share_the_semantic_mask() {
+        // cells: a (0..3), the seam (3), b (4..7), floor beside b (7), someone neither found (8), background
+        let a = vec![2.0, 2.5, 1.0, -0.5, -3.0, -5.0, -6.0, -3.5, -9.0, -9.0];
+        let b = vec![-6.0, -5.0, -3.0, -1.0, 1.0, 2.5, 2.0, -3.0, -9.0, -9.0];
+        let mut inst = vec![a, b];
+        let semantic = [5.0, 6.0, 5.0, 4.0, 5.0, 6.0, 5.0, -7.0, 5.0, -8.0];
+        share(&mut inst, &semantic);
+        assert_eq!(inst[0][..4], [5.0, 6.0, 5.0, 4.0], "a's share, the seam included (a is the stronger there)");
+        assert_eq!(inst[1][4..7], [5.0, 6.0, 5.0], "b's share");
+        assert_eq!(inst[0][4..7], [-3.0, -5.0, -6.0], "a stays out of b");
+        assert_eq!(inst[1][7], -7.0, "the floor near b is surely background");
+        assert_eq!([inst[0][8], inst[1][8]], [-9.0, -9.0], "someone neither instance is near joins neither");
+        // an instance surer than the semantic mask keeps its own logits
+        let mut sure = vec![vec![9.0, 1.0]];
+        share(&mut sure, &[5.0, 5.0]);
+        assert_eq!(sure[0], [9.0, 5.0]);
+        // mismatched sizes (no semantic mask) leave the instances alone
+        let mut none = vec![vec![1.0, 2.0]];
+        share(&mut none, &[]);
+        assert_eq!(none[0], [1.0, 2.0]);
+    }
+
+    /// Describe: the instances above the threshold, each with its share of the semantic mask, merged;
+    /// a query below the threshold adds nothing, and nothing found is `None`.
+    #[test]
+    fn describe_merges_the_shares_of_what_it_found() {
+        // two instances, weak inside and both fading where they touch (cell 2); a third query scores low
+        let masks = [[2.0f32, 1.0, -0.5, -3.0, -6.0], [-6.0, -3.0, -1.0, 1.0, 2.0], [-9.0, -9.0, -9.0, -9.0, 3.0]];
+        let output = |logits: [f32; 3], semantic: &[f32]| Output {
+            masks: Tensor::from_vec(masks.concat(), (3, 1, 5), &Device::Cpu).unwrap(),
+            logits: logits.to_vec(),
+            presence: 8.0,
+            boxes: vec![[0.0; 4]; 3],
+            text: Tensor::zeros(1, candle_core::DType::F32, &Device::Cpu).unwrap(),
+            semantic: semantic.to_vec(),
+            memory: Tensor::zeros(1, candle_core::DType::F32, &Device::Cpu).unwrap(),
+        };
+        let semantic = [5.0, 6.0, 4.0, 6.0, 5.0];
+        let merged = merge(&output([4.0, 4.0, -6.0], &semantic), 0.5).unwrap();
+        assert_eq!(merged.logits, semantic, "sure inside both and across where they touch");
+        // without a semantic mask: the per-pixel maximum of the instances, as before
+        let plain = merge(&output([4.0, 4.0, -6.0], &[]), 0.5).unwrap();
+        assert_eq!(plain.logits, [2.0, 1.0, -0.5, 1.0, 2.0]);
+        assert!(merge(&output([-6.0; 3], &semantic), 0.5).is_none(), "nothing found");
+    }
+}
